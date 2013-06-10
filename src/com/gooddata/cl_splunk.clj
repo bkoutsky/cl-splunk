@@ -5,7 +5,7 @@
             [clj-time.coerce :as time-coerce]
             [clojure.string :as string]
             [cheshire.core :as json])
-  (:import (com.splunk ServiceArgs Service JobExportArgs JobExportArgs$SearchMode MultiResultsReaderXml MultiResultsReaderJson)
+  (:import (com.splunk ServiceArgs Service JobExportArgs JobExportArgs$SearchMode JobExportArgs$OutputMode MultiResultsReaderXml MultiResultsReaderJson)
            (org.joda.time DateTime)
            (java.text SimpleDateFormat)
            (java.util Date)))
@@ -74,53 +74,59 @@
    ;; TODO: Parse time stamps
    :else value))
 
-(defn key-value
+(defn convert-field
   [event key]
   (let [values (map convert-value (.getArray event key))]
-    (if (not= 1 (count values))
-      values
-      (first values))))
+    (if (= 1 (count values))
+      (first values)
+      values)))
 
 (defn convert-event
   "Converts Splunk's Event to sensible hashmap"
   [event]
   (let [fields (for [key (.keySet event)]
-                 [key (key-value event key)])]
-    (into {} fields)))
+                 [key (convert-field event key)])
+        result (into {} fields)]
+    result))
 
-(defn read-multi-results [multi-reader]
-  (for [reader multi-reader
-        :when (not (.isPreview reader))
-        event reader]
-    (convert-event event)))
+
+;; If you think that read-results and read-multi-results could be easily merged into
+;; one function with a single (for) and no (concat), well, no.
+;; It seems that there's some interference between (for)'s eager-laziness
+;; and Splunk's handling of readers that results in weird random failures if you do this.
+;; Trust me, I tried.
+
+(defn read-results
+  [reader]
+  (doall (for [event reader]
+           (convert-event event))))
+
+(defn read-multi-results
+  [multi-reader]
+  (doall (for [reader (seq multi-reader)
+               :when (not (.isPreview reader))]
+           (read-results reader))))
 
 (defn export-search
   [splunk search from to]
   (let [args (doto (JobExportArgs.)
                (.setEarliestTime (mktime from))
                (.setLatestTime (mktime to))
-               (.setSearchMode JobExportArgs$SearchMode/NORMAL))
+               (.setSearchMode JobExportArgs$SearchMode/NORMAL)
+               (.setOutputMode JobExportArgs$OutputMode/JSON))
         export (.export splunk search args)
-        mrr (MultiResultsReaderXml. export)]
-    (read-multi-results mrr)))
-
-;;(defn print-events-from-rr [rr]
-;;  (dorun (map #(print (str (.get % "_time") "," (.get % "method") "," (.get % "duration") "" \newline)) rr)))
-
-;; (defn print-events-from-multi [mrr]
-;;   (doseq [r mrr
-;;           :when (not (.isPreview r))]
-;;     (do
-;;         (print-events-from-rr r))))
-
-
+        multi-reader (MultiResultsReaderJson. export)
+        results (read-multi-results multi-reader)]
+    (apply concat results)))
 
 (defn -main
   "I don't do a whole lot ... yet."
   [& args]
   (let [spl (connect)
-        srch (export-search spl "search index=gdc sourcetype=erlang (gcf_event=\"new task\" OR gcf_event=\"task waiting\" OR gcf_event=\"task started\" OR gcf_event=\"task finished\" OR gcf_event=\"processing task\" OR gcf_event=\"task computed\") | table _time, task_id, request_id, host, gcf_event, task_type, time" "-5min" "-4min")]
+        ;;        srch (export-search spl "search index=gdc sourcetype=erlang (gcf_event='new task' OR gcf_event='task waiting' OR gcf_event='task started' OR gcf_event='task finished' OR gcf_event='processing task' OR gcf_event='task computed') | table _time, task_id, request_id, host, gcf_event, task_type, time" "-5min" "-4min")]
+        srch (export-search spl "search index=gdc sourcetype=log4j method=GET | table _time, uri, httpStatus" "-0d@d+15h" "-0d@d+15h+1min")]
     (doall (map #(-> %
                      (json/generate-string {:pretty true})
                      println)
-                srch))))
+                srch)))
+  (println "finished"))
