@@ -1,48 +1,59 @@
 (ns com.gooddata.cl-splunk
   (:gen-class)
-  (:use [slingshot.slingshot :only [throw+]])
+  (:use [slingshot.slingshot :only [try+ throw+]])
   (:require [clj-time.core :as time]
             [clj-time.coerce :as time-coerce]
+            [clj-time.format :as time-format]
             [clojure.string :as string]
-            [cheshire.core :as json])
+            [cheshire.core :as json]
+            [cheshire.generate :refer [add-encoder encode-str remove-encoder]])
   (:import (com.splunk ServiceArgs Service JobExportArgs JobExportArgs$SearchMode JobExportArgs$OutputMode MultiResultsReaderXml MultiResultsReaderJson)
            (org.joda.time DateTime)
            (java.text SimpleDateFormat)
-           (java.util Date)))
+           (java.util Date)
+           (java.io File)))
 
 
 ;; (def ^:dynamic *splunk* nil)
 
-(defn splunk-port [port]
-  (cond
-   port port
-   (System/getenv "SPLUNK_PORT") (Integer. (System/getenv "SPLUNK_PORT"))
-   :else 8089))
+(defn- get-env-defaults
+  []
+  (let [username (System/getenv "SPLUNK_USERNAME")
+        password (System/getenv "SPLUNK_PASSWORD")
+        host (System/getenv "SPLUNK_HOST")
+        port (if-let [port (System/getenv "SPLUNK_PORT")]
+               (Integer. (string/trim port))
+               nil)]
+    [username password host port]))
 
-(defn splunk-host [host]
-  (cond
-   host host
-   (System/getenv "SPLUNK_HOST") (System/getenv "SPLUNK_HOST")))
+(defn- get-file-defaults
+  []
+  (let [filename (str (System/getProperty "user.home") "/.splunk.json")]
+    (if (-> filename File. .isFile)
+      (let [defaults (->> filename
+                          clojure.java.io/reader
+                          json/parse-stream)]
+        (when-not (associative? defaults) (throw+ {:type ::config-not-a-map, :value filename}))
+        (map #(defaults %) ["username" "password" "host" "port"]))
+      [nil nil nil nil])))
 
-
-(defn connection-defaults
+(defn- connection-defaults
   [& args]
-  (let [defaults_map (json/parse-stream (clojure.java.io/reader (str (System/getProperty "user.home") "/.splunk.json")))
-        defaults_list (map #(defaults_map %) ["username" "password" "host" "port"])]
-    (map #(some identity %&) args defaults_list [nil nil nil 8089])))
-
+  (let [defaults-file (get-file-defaults)
+        defaults-env (get-env-defaults)]
+    (map #(some identity %&) args defaults-file defaults-env [nil nil nil 8089])))
 
 (defn connect
   ([] (apply connect (connection-defaults nil nil nil nil)))
-
   ([username password] (apply connect (connection-defaults username password nil nil)))
+  ([username password host] (apply connect (connection-defaults username password host nil)))
 
   ([username password host port]
    (let [args (doto (ServiceArgs.)
                 (.setUsername username)
                 (.setPassword password)
-                (.setHost (splunk-host host))
-                (.setPort (splunk-port port)))]
+                (.setHost host)
+                (.setPort port))]
      (Service/connect args))))
 
 
@@ -61,18 +72,37 @@
    (and (instance? String time)
         (re-matches #"^\s*\d+(\.\d*)?\s*" time)) (string/trim time)
    (sequential? time) (-> (apply time/date-time time) time-coerce/to-long str)
-   :else time))
+   (instance? String time) time
+   :else (throw+ {:type ::invalid-time, :value time})))
 
-;;(let [x (time/date-time 1986 10 14 4 3 27 456)]
-;;  (mktime "x12341234"))
+
+
+(def time-zones {"GMT" 0, "CEST" 2, "CET" 1, "PST" -8, "PDT" -7})
+(def time-format (time-format/formatter nil "yyyy-MM-dd hh:mm:ss.SSS" "yyyy-MM-dd hh:mm:ss"))
+
+
+(add-encoder DateTime encode-str)
+
+(defn convert-date
+  [[all ts tz-name]]
+  (let [tz (-> tz-name time-zones time/time-zone-for-offset)
+        time (time-format/parse time-format ts)]
+    (time/from-time-zone time tz)))
+
+;;; When adding extra patterns, make sure they contain
+;;; at least one capturing group, even if not strictly necessary.
+(def convert-patterns [[#"^\s*(\d+)\s*$" #(Long. (first %))]
+                       [#"^\s*(\d*\.\d+)\s*$" #(Double. (first %))]
+                       [#"^\s*(\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d(?:\.\d+)?)\s+([A-Z]+)?$" convert-date]
+                       [#"^(.*)$" #(first %)]])
 
 (defn convert-value
   [value]
-  (cond
-   (re-matches #"\s*\d+\s*" value) (Long. (string/trim value))
-   (re-matches #"\s*\d*\.\d+\s*" value) (Double. (string/trim value))
-   ;; TODO: Parse time stamps
-   :else value))
+
+  (first (for [[rx f] convert-patterns
+               :let [match (first (re-seq rx value))]
+               :when match]
+           (f match))))
 
 (defn convert-field
   [event key]
@@ -88,7 +118,6 @@
                  [key (convert-field event key)])
         result (into {} fields)]
     result))
-
 
 ;; If you think that read-results and read-multi-results could be easily merged into
 ;; one function with a single (for) and no (concat), well, no.
@@ -119,14 +148,22 @@
         results (read-multi-results multi-reader)]
     (apply concat results)))
 
+
+(defn search-to-json
+  ([search] (search-to-json search {}))
+  ([search opts]
+   (dorun (map #(-> %
+                    ;(json/generate-string opts)
+                    prn)
+               search))))
+
 (defn -main
-  "I don't do a whole lot ... yet."
   [& args]
   (let [spl (connect)
-        ;;        srch (export-search spl "search index=gdc sourcetype=erlang (gcf_event='new task' OR gcf_event='task waiting' OR gcf_event='task started' OR gcf_event='task finished' OR gcf_event='processing task' OR gcf_event='task computed') | table _time, task_id, request_id, host, gcf_event, task_type, time" "-5min" "-4min")]
-        srch (export-search spl "search index=gdc sourcetype=log4j method=GET | table _time, uri, httpStatus" "-0d@d+15h" "-0d@d+15h+1min")]
-    (doall (map #(-> %
-                     (json/generate-string {:pretty true})
-                     println)
-                srch)))
-  (println "finished"))
+        srch (export-search spl "search index=gdc sourcetype=erlang (gcf_event=\"new task\" OR gcf_event=\"task waiting\" OR gcf_event=\"task started\" OR gcf_event=\"task finished\" OR gcf_event=\"processing task\" OR gcf_event=\"task computed\") | table _time, task_id, request_id, task_type, gcf_event, time, project " "-0d@d+11h" "-0d@d+11h+10sec")]
+    (search-to-json srch)
+
+    (let [runtime (Runtime/getRuntime)
+          free (/ (.freeMemory runtime) 1024 1024)
+          total (/ (.totalMemory runtime) 1024 1024)]
+      (println "Complete. Memory total " (int total) ", used " (int (- total free)) ", free " (int free)))))
