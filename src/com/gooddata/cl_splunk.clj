@@ -5,8 +5,7 @@
             [clj-time.coerce :as time-coerce]
             [clj-time.format :as time-format]
             [clojure.string :as string]
-            [cheshire.core :as json]
-            [cheshire.generate :refer [add-encoder encode-str remove-encoder]])
+            [cheshire.core :as json])
   (:import (com.splunk ServiceArgs Service JobExportArgs JobExportArgs$SearchMode JobExportArgs$OutputMode MultiResultsReaderXml MultiResultsReaderJson)
            (org.joda.time DateTime)
            (java.text SimpleDateFormat)
@@ -30,7 +29,7 @@
   []
   (let [filename (str (System/getProperty "user.home") "/.splunk.json")]
     (if (-> filename File. .isFile)
-      (let [defaults (->> filename
+      (let [defaults (-> filename
                           clojure.java.io/reader
                           json/parse-stream)]
         (when-not (associative? defaults) (throw+ {:type ::config-not-a-map, :value filename}))
@@ -57,7 +56,15 @@
      (Service/connect args))))
 
 
-(defn mktime
+(defn- guess-time-unit
+  "Guess if argument is UNIX time in seconds or milliseconds.
+  Return UNIX time in milliseconds."
+  [x]
+  (if (< x 978307200000)
+    (* 1000 x)
+    x))
+
+(defn splunk-time
   "Convert anything to Splunk timespec, for certain definitions of \"anything\".
   Instance of org.joda.time.DateTime and java.util.Date is converted to unix time.
   Instances of Number and number-like Strings are assumed to be unix time.
@@ -65,29 +72,31 @@
   Seq is assumed to be [year month day hour minute sec milisecond], any tail can be ommited."
   [time]
   (cond
-   ;; Convert instance of org.joda.time.Datetime to UTC seconds
+   ;; Convert instance of org.joda.time.Datetime to unix epoch milliseconds
    (instance? Date time) (str (.getTime time))
-   (instance? DateTime time) (str (time-coerce/to-long time))
-   (instance? Number time) (str time)
+   (instance? DateTime time) (-> time time-coerce/to-long)
+   (instance? clojure.lang.Ratio time) (str (guess-time-unit time))
+   (instance? Number time) (str (guess-time-unit time))
    (and (instance? String time)
         (re-matches #"^\s*\d+(\.\d*)?\s*" time)) (string/trim time)
-   (sequential? time) (-> (apply time/date-time time) time-coerce/to-long str)
+   (sequential? time) (-> (apply time/date-time time)
+                          (time/from-time-zone (time/default-time-zone))
+                          time-coerce/to-long)
    (instance? String time) time
    :else (throw+ {:type ::invalid-time, :value time})))
 
-
-
 (def time-zones {"GMT" 0, "CEST" 2, "CET" 1, "PST" -8, "PDT" -7})
 (def time-format (time-format/formatter nil "yyyy-MM-dd hh:mm:ss.SSS" "yyyy-MM-dd hh:mm:ss"))
-
-
-(add-encoder DateTime encode-str)
 
 (defn convert-date
   [[all ts tz-name]]
   (let [tz (-> tz-name time-zones time/time-zone-for-offset)
         time (time-format/parse time-format ts)]
-    (time/from-time-zone time tz)))
+    (-> time
+        (time/from-time-zone tz)
+        time-coerce/to-long)))
+
+(convert-date [nil "2013-06-12 12:23:00.000" "CEST"])
 
 ;;; When adding extra patterns, make sure they contain
 ;;; at least one capturing group, even if not strictly necessary.
@@ -139,12 +148,12 @@
 (defn export-search
   [splunk search from to]
   (let [args (doto (JobExportArgs.)
-               (.setEarliestTime (mktime from))
-               (.setLatestTime (mktime to))
+               (.setEarliestTime (splunk-time from))
+               (.setLatestTime (splunk-time to))
                (.setSearchMode JobExportArgs$SearchMode/NORMAL)
-               (.setOutputMode JobExportArgs$OutputMode/JSON))
+               (.setOutputMode JobExportArgs$OutputMode/XML))
         export (.export splunk search args)
-        multi-reader (MultiResultsReaderJson. export)
+        multi-reader (MultiResultsReaderXml. export)
         results (read-multi-results multi-reader)]
     (apply concat results)))
 
@@ -153,8 +162,8 @@
   ([search] (search-to-json search {}))
   ([search opts]
    (dorun (map #(-> %
-                    ;(json/generate-string opts)
-                    prn)
+                    (json/generate-string opts)
+                    println)
                search))))
 
 (defn -main
