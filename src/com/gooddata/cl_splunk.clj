@@ -1,6 +1,7 @@
 (ns com.gooddata.cl-splunk
   (:gen-class)
-  (:use [slingshot.slingshot :only [try+ throw+]])
+  (:use [slingshot.slingshot :only [try+ throw+]]
+         clojure.java.io)
   (:require [clj-time.core :as time]
             [clj-time.coerce :as time-coerce]
             [clj-time.format :as time-format]
@@ -8,7 +9,6 @@
             [cheshire.core :as json])
   (:import (com.splunk ServiceArgs Service JobExportArgs JobExportArgs$SearchMode JobExportArgs$OutputMode MultiResultsReaderXml MultiResultsReaderJson)
            (org.joda.time DateTime)
-           (java.text SimpleDateFormat)
            (java.util Date)
            (java.io File)))
 
@@ -56,47 +56,72 @@
      (Service/connect args))))
 
 
-(defn- guess-time-unit
+
+(defn- time-to-ms
   "Guess if argument is UNIX time in seconds or milliseconds.
   Return UNIX time in milliseconds."
   [x]
-  (if (< x 978307200000)
-    (* 1000 x)
-    x))
+  (let [t (if (< x 4133980800)
+            (* 1000 x)
+            x)]
+    (long t)))
 
-(defn splunk-time
+(defn- ms-to-s
+  [ms]
+  (let [integer (quot ms 1000)
+        fraction (rem ms 1000)
+        fraction (if (= fraction 0) "" (format ".%03d" fraction))]
+      (str integer fraction)))
+
+(defn- splunk-time
   "Convert anything to Splunk timespec, for certain definitions of \"anything\".
-  Instance of org.joda.time.DateTime and java.util.Date is converted to unix time.
+  Instances of org.joda.time.DateTime and java.util.Date are converted to unix time.
   Instances of Number and number-like Strings are assumed to be unix time.
-  Other instances of String are assumed to be Splunk time-spec.
-  Seq is assumed to be [year month day hour minute sec milisecond], any tail can be ommited."
+  Other instances of String are assumed to be Splunk time-spec and are passed as-is.
+  Seq is assumed to be [year month day hour minute sec milisecond] in current time zone, any tail can be ommited."
   [time]
   (cond
    ;; Convert instance of org.joda.time.Datetime to unix epoch milliseconds
-   (instance? Date time) (str (.getTime time))
-   (instance? DateTime time) (-> time time-coerce/to-long)
-   (instance? clojure.lang.Ratio time) (str (guess-time-unit time))
-   (instance? Number time) (str (guess-time-unit time))
+    ;;; java.util.Date
+   (instance? Date time) (-> (.getTime time) ms-to-s)
+   ;;; org.jodatime.DateTime
+   (instance? DateTime time) (-> time time-coerce/to-long ms-to-s)
+
+   ;;; clojure.lang.Ratio
+   (instance? clojure.lang.Ratio time) (str (ms-to-s (time-to-ms time)))
+   ;;; other Numbers
+   (instance? Number time) (ms-to-s (time-to-ms time))
+   ;;; integer string
    (and (instance? String time)
-        (re-matches #"^\s*\d+(\.\d*)?\s*" time)) (string/trim time)
+        (re-matches #"^\s*\d+?\s*" time)) (-> time string/trim Long. time-to-ms ms-to-s)
+   ;;; double string
+   (and (instance? String time)
+        (re-matches #"^\s*\d+(\.\d*)?\s*" time)) (-> time string/trim Double. time-to-ms ms-to-s)
    (sequential? time) (-> (apply time/date-time time)
                           (time/from-time-zone (time/default-time-zone))
                           time-coerce/to-long)
    (instance? String time) time
    :else (throw+ {:type ::invalid-time, :value time})))
 
-(def time-zones {"GMT" 0, "CEST" 2, "CET" 1, "PST" -8, "PDT" -7})
-(def time-format (time-format/formatter nil "yyyy-MM-dd hh:mm:ss.SSS" "yyyy-MM-dd hh:mm:ss"))
+(def tz-offsets [["GMT" 0]
+                 ["UTC" 0]
+                 ["CEST" 2]
+                 ["CET" 1]
+                 ["PST" -8]
+                 ["PDT" -7]])
 
-(defn convert-date
+(def time-zones (into {} (for [[name offset] tz-offsets] [name (time/time-zone-for-offset offset)])))
+(def time-format (time-format/formatter nil "yyyy-MM-dd HH:mm:ss.SSS" "yyyy-MM-dd HH:mm:ss"))
+
+(defn- convert-date
   [[all ts tz-name]]
-  (let [tz (-> tz-name time-zones time/time-zone-for-offset)
+  (let [tz (time-zones tz-name)
         time (time-format/parse time-format ts)]
+    (when-not tz (throw+ {:type ::unknown-time-zone :value tz-name}))
     (-> time
         (time/from-time-zone tz)
         time-coerce/to-long)))
 
-(convert-date [nil "2013-06-12 12:23:00.000" "CEST"])
 
 ;;; When adding extra patterns, make sure they contain
 ;;; at least one capturing group, even if not strictly necessary.
@@ -105,7 +130,7 @@
                        [#"^\s*(\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d(?:\.\d+)?)\s+([A-Z]+)?$" convert-date]
                        [#"^(.*)$" #(first %)]])
 
-(defn convert-value
+(defn- convert-value
   [value]
 
   (first (for [[rx f] convert-patterns
@@ -113,14 +138,14 @@
                :when match]
            (f match))))
 
-(defn convert-field
+(defn- convert-field
   [event key]
   (let [values (map convert-value (.getArray event key))]
     (if (= 1 (count values))
       (first values)
       values)))
 
-(defn convert-event
+(defn- convert-event
   "Converts Splunk's Event to sensible hashmap"
   [event]
   (let [fields (for [key (.keySet event)]
@@ -168,9 +193,22 @@
 
 (defn -main
   [& args]
-  (let [spl (connect)
-        srch (export-search spl "search index=gdc sourcetype=erlang (gcf_event=\"new task\" OR gcf_event=\"task waiting\" OR gcf_event=\"task started\" OR gcf_event=\"task finished\" OR gcf_event=\"processing task\" OR gcf_event=\"task computed\") | table _time, task_id, request_id, task_type, gcf_event, time, project " "-0d@d+11h" "-0d@d+11h+10sec")]
-    (search-to-json srch)
+  (let [spl (connect)]
+
+    (dorun (for [day (range 166 136 -1)
+          hour (range 0 24)]
+      (let [from (format "-0y@y+%dd+%dh" day hour)
+            to (format "-0y@y+%dd+%dh" day (inc hour))
+            filename (format "dump-%d-%d.json" day hour)]
+        (println "Generating from" from "to" to ", file" filename)
+        (with-open [w (clojure.java.io/writer filename)]
+          (let [search (export-search spl
+                                      "search index=gdc sourcetype=erlang (gcf_event=\"new task\" OR gcf_event=\"task waiting\" OR gcf_event=\"task started\" OR gcf_event=\"task finished\" OR gcf_event=\"processing task\" OR gcf_event=\"task computed\") | table _time, task_id, request_id, task_type, gcf_event, time, project, parse_time, insert_time, size, resolution, get_time, write_time, enqueue_time, wait_time, waiting_cnt, result, worker_pid"
+                                      ;"search index=gdc sourcetype=erlang (gcf_event=\"new task\" OR gcf_event=\"task waiting\" OR gcf_event=\"task started\" OR gcf_event=\"task finished\" OR gcf_event=\"processing task\" OR gcf_event=\"task computed\") | stats count by task_type "
+                                      from
+                                      to)]
+            (dorun (for [event search]
+                     (.write w (str (json/generate-string event) "\n")))))))))
 
     (let [runtime (Runtime/getRuntime)
           free (/ (.freeMemory runtime) 1024 1024)
