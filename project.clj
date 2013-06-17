@@ -14,4 +14,4 @@
 
   :repositories {"local" ~(str (.toURI (java.io.File. "repo")))}
   :main com.gooddata.cl-splunk
-  :jvm-opts ["-Xmx 2g"])
+  :jvm-opts ["-Xmx 4g"])

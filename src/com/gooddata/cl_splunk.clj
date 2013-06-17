@@ -33,7 +33,7 @@
                          clojure.java.io/reader
                          json/parse-stream)]
         (when-not (associative? defaults) (throw+ {:type ::config-not-a-map, :value filename}))
-        (map #(defaults %) ["username" "password" "host" "port"]))
+        (map defaults ["username" "password" "host" "port"]))
       [nil nil nil nil])))
 
 (defn- connection-defaults
@@ -203,7 +203,7 @@
   [& args]
   (let [spl (connect)]
 
-    (dorun (for [day (range 166 136 -1)
+    (dorun (for [day (range 166 134 -1)
                  hour (range 0 24)]
              (let [from (format "-0y@y+%dd+%dh" day hour)
                    to (format "-0y@y+%dd+%dh" day (inc hour))
