@@ -203,7 +203,7 @@
   [& args]
   (let [spl (connect)]
 
-    (dorun (for [day (range 166 134 -1)
+    (dorun (for [day (range 160 134 -1)
                  hour (range 0 24)]
              (let [from (format "-0y@y+%dd+%dh" day hour)
                    to (format "-0y@y+%dd+%dh" day (inc hour))

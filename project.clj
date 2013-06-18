@@ -13,5 +13,5 @@
   ;; mvn install:install-file -Dfile=splunk-1.1.jar -DartifactId=splunk -Dversion=1.1 -DgroupId=splunk -Dpackaging=jar -DlocalRepositoryPath=repo  -DcreateChecksum=true
 
   :repositories {"local" ~(str (.toURI (java.io.File. "repo")))}
-  :main com.gooddata.cl-splunk
+  :main com.gooddata.cl-splunk.saved-search
   :jvm-opts ["-Xmx 4g"])
