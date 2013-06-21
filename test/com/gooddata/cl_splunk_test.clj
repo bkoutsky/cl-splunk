@@ -38,7 +38,21 @@
              "1371384000")))
     (testing "from non-numeric string"
       (is (= (splunk-time "2d@d")
-             "2d@d"))))
+             "2d@d")))
+    (testing "from [y m d] sequence"
+      (is (= (splunk-time [2013 6 20])
+             "1371679200")))
+    (testing "from [y m d h m] sequence"
+      (is (= (splunk-time [2013 6 20 13 30])
+             "1371727800")))
+    (testing "from [y m d h m s] sequence"
+      (is (= (splunk-time [2013 6 20 13 30 11])
+             "1371727811")))
+    (testing "from [y m d h m s] sequence"
+      (is (= (splunk-time [2013 6 20 13 30 11 543])
+             "1371727811.543")))
+
+    )
 
   (deftest time-to-ms-test
     (testing "time in seconds"

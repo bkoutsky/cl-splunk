@@ -77,7 +77,7 @@
 (defn- splunk-time
   "Convert anything to Splunk timespec, for certain definitions of \"anything\".
   Instances of org.joda.time.DateTime and java.util.Date are converted to unix time.
-  Instances of Number and number-like Strings are assumed to be unix time.
+  Instances of Number and number-like Strings are assumed to be unix time, possibly in ms.
   Other instances of String are assumed to be Splunk time-spec and are passed as-is.
   Seq is assumed to be [year month day hour minute sec milisecond] in current time zone, any tail can be ommited."
   [time]
@@ -100,7 +100,8 @@
         (re-matches #"^\s*\d+(\.\d*)?\s*" time)) (-> time string/trim Double. time-to-ms ms-to-s)
    (sequential? time) (-> (apply time/date-time time)
                           (time/from-time-zone (time/default-time-zone))
-                          time-coerce/to-long)
+                          time-coerce/to-long
+                          ms-to-s)
    (instance? String time) time
    :else (throw+ {:type ::invalid-time, :value time})))
 
