@@ -1,4 +1,4 @@
-(ns com.gooddata.cl-splunk
+(ns cl-splunk
   (:gen-class)
   (:use [slingshot.slingshot :only [try+ throw+]]
         clojure.java.io)
@@ -6,7 +6,8 @@
             [clj-time.coerce :as time-coerce]
             [clj-time.format :as time-format]
             [clojure.string :as string]
-            [cheshire.core :as json])
+            [cheshire.core :as json]
+            [clj-yaml.core :as yaml])
   (:import (com.splunk ServiceArgs Service JobExportArgs JobExportArgs$SearchMode JobExportArgs$OutputMode MultiResultsReaderXml MultiResultsReaderJson)
            (org.joda.time DateTime)
            (java.util Date)
@@ -27,13 +28,13 @@
 
 (defn- get-file-defaults
   []
-  (let [filename (str (System/getProperty "user.home") "/.splunk.json")]
+  (let [filename (str (System/getProperty "user.home") "/.splunk.yaml")]
     (if (-> filename File. .isFile)
       (let [defaults (-> filename
-                         clojure.java.io/reader
-                         json/parse-stream)]
+                         slurp
+                         yaml/parse-string)]
         (when-not (associative? defaults) (throw+ {:type ::config-not-a-map, :value filename}))
-        (map defaults ["username" "password" "host" "port"]))
+        (map defaults [:username :password :host :port]))
       [nil nil nil nil])))
 
 (defn- connection-defaults
@@ -75,7 +76,7 @@
     (str integer fraction)))
 
 (defn- splunk-time
-  "Convert anything to Splunk timespec, for certain definitions of \"anything\".
+  "Convert anything to Splunk timespec, for certain definition of \"anything\".
   Instances of org.joda.time.DateTime and java.util.Date are converted to unix time.
   Instances of Number and number-like Strings are assumed to be unix time, possibly in ms.
   Other instances of String are assumed to be Splunk time-spec and are passed as-is.
@@ -149,7 +150,8 @@
 
 (defn- convert-field
   [event key]
-  (let [values (map convert-value (.getArray event key))]
+  ;;(let [values (map convert-value (.getArray event key))]
+  (let [values (.getArray event key)]
     (if (= 1 (count values))
       (first values)
       values)))
@@ -200,26 +202,47 @@
                     println)
                search))))
 
+(defn run-query [spl from to filename]
+  (println "Generating from" from "to" to ", file" filename)
+  (try+
+   (with-open [w (clojure.java.io/writer filename)]
+     (binding [*out* w]
+       (let [search (export-search spl
+                                   "search sourcetype=erlang gcf_event=* "
+                                   from
+                                   to)]
+         (doseq [event search
+                 :let [event (apply merge (map (fn [[k v]] {(keyword (.toLowerCase k)) v}) event))]]
+           (prn event)))))
+   (catch Object e
+     (println "error in " from ": " (str e) " " (.getMessage e))))
+  (println "Finished " from)
+  spl)
+
+(def THREADS 6)
+
 (defn -main
   [& args]
-  (let [spl (connect)]
+  (println "Starting up")
+  (let [splunk (connect)
+        agents (vec (map (fn [_] (agent splunk :error-mode :continue)) (range 0 THREADS)))]
+    (println "agents created")
+;;     (doseq [day (range 0 31)
+;;             hour (range 0 24)
+;;             minute (range 0 60 10)]
+    (doseq [day (range 0 1)
+            hour (range 0 1)
+            minute (range 0 60 10)]
 
-    (dorun (for [day (range 160 134 -1)
-                 hour (range 0 24)]
-             (let [from (format "-0y@y+%dd+%dh" day hour)
-                   to (format "-0y@y+%dd+%dh" day (inc hour))
-                   filename (format "dump-%d-%d.json" day hour)]
-               (println "Generating from" from "to" to ", file" filename)
-               (with-open [w (clojure.java.io/writer filename)]
-                 (let [search (export-search spl
-                                             "search index=gdc sourcetype=erlang (gcf_event=\"new task\" OR gcf_event=\"task waiting\" OR gcf_event=\"task started\" OR gcf_event=\"task finished\" OR gcf_event=\"processing task\" OR gcf_event=\"task computed\") | table _time, task_id, request_id, task_type, gcf_event, time, project, parse_time, insert_time, size, resolution, get_time, write_time, enqueue_time, wait_time, waiting_cnt, result, worker_pid"
-                                             ;"search index=gdc sourcetype=erlang (gcf_event=\"new task\" OR gcf_event=\"task waiting\" OR gcf_event=\"task started\" OR gcf_event=\"task finished\" OR gcf_event=\"processing task\" OR gcf_event=\"task computed\") | stats count by task_type "
-                                             from
-                                             to)]
-                   (dorun (for [event search]
-                            (.write w (str (json/generate-string event) "\n")))))))))
+      (let [from (format "-1month@month+%dd@d+%dh+%dmin" day hour minute)
+            to (format "-1month@month+%dd@d+%dh+%dmin" day hour (+ minute 10))
+            filename (format "data/dump-%02d-%02d-%02d" day hour minute)]
+        (send-off (agents (quot minute 10)) run-query from to filename)))
+
+    (apply await agents)
 
     (let [runtime (Runtime/getRuntime)
           free (/ (.freeMemory runtime) 1024 1024)
           total (/ (.totalMemory runtime) 1024 1024)]
-      (println "Complete. Memory total " (int total) ", used " (int (- total free)) ", free " (int free)))))
+      (println "Complete. Memory total " (int total) ", used " (int (- total free)) ", free " (int free)))
+    (shutdown-agents)))
